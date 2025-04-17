@@ -1,4 +1,13 @@
+pandas
+numpy
 torch
 transformers
+scikit-learn
 tqdm
 wandb
+requests
+beautifulsoup4
+selenium
+webdriver-manager
+fake-useragent
+python-dotenv
