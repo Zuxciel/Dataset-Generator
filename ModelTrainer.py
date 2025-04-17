@@ -17,6 +17,7 @@ from tqdm import tqdm
 import wandb
 import random
 from datetime import datetime
+import glob
 
 # Setup logging
 logging.basicConfig(
@@ -50,6 +51,9 @@ class ForthnlesConfig:
         # Data configuration
         self.data_dir = "chat_datasets"
         self.output_dir = "forthnles_model"
+        
+        # Resume training
+        self.resume_training = False
         
         # Mixed precision training
         self.fp16 = torch.cuda.is_available()
@@ -150,43 +154,97 @@ class ForthnlesTrainer:
         
     def setup_tokenizer(self):
         """Initialize the tokenizer"""
-        logger.info(f"Loading tokenizer based on {self.config.base_model}")
-        tokenizer = AutoTokenizer.from_pretrained(self.config.base_model)
+        # First check if there's a saved tokenizer in the output directory
+        conv_tokenizer_path = os.path.join(self.config.output_dir, "conversation", "final_model")
         
-        # Add special tokens for conversation
-        special_tokens = {
-            'additional_special_tokens': ['user:', 'assistant:']
-        }
-        tokenizer.add_special_tokens(special_tokens)
+        if os.path.exists(conv_tokenizer_path) and self.config.resume_training:
+            logger.info(f"Loading existing tokenizer from {conv_tokenizer_path}")
+            tokenizer = AutoTokenizer.from_pretrained(conv_tokenizer_path)
+        else:
+            logger.info(f"Loading tokenizer based on {self.config.base_model}")
+            tokenizer = AutoTokenizer.from_pretrained(self.config.base_model)
+            
+            # Add special tokens for conversation
+            special_tokens = {
+                'additional_special_tokens': ['user:', 'assistant:']
+            }
+            tokenizer.add_special_tokens(special_tokens)
         
         # Set padding token if not set
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
+            # Also add pad_token_id to the tokenizer for consistent batch processing
+            tokenizer.pad_token_id = tokenizer.eos_token_id
         
         self.tokenizer = tokenizer
         return tokenizer
     
+    def find_latest_checkpoint(self, model_type):
+        """Find the latest checkpoint for a given model type"""
+        checkpoint_dir = os.path.join(self.config.output_dir, model_type)
+        if not os.path.exists(checkpoint_dir):
+            return None
+            
+        checkpoint_dirs = glob.glob(os.path.join(checkpoint_dir, "checkpoint-*"))
+        if "final_model" in os.listdir(checkpoint_dir):
+            checkpoint_dirs.append(os.path.join(checkpoint_dir, "final_model"))
+            
+        if not checkpoint_dirs:
+            return None
+            
+        # Sort by checkpoint number to find the latest one
+        checkpoint_dirs.sort(key=lambda x: int(x.split("-")[-1]) if "-" in x else float('inf'))
+        latest_checkpoint = checkpoint_dirs[-1]
+        
+        return latest_checkpoint
+    
     def setup_conversation_model(self):
         """Initialize the conversation model"""
-        logger.info(f"Setting up conversation model based on {self.config.base_model}")
-        model = AutoModelForCausalLM.from_pretrained(self.config.base_model)
+        # Check for existing model to resume from
+        latest_checkpoint = None
+        if self.config.resume_training:
+            latest_checkpoint = self.find_latest_checkpoint("conversation")
         
-        # Resize token embeddings for added special tokens
-        model.resize_token_embeddings(len(self.tokenizer))
+        if latest_checkpoint and os.path.exists(latest_checkpoint):
+            logger.info(f"Resuming conversation model from checkpoint: {latest_checkpoint}")
+            model = AutoModelForCausalLM.from_pretrained(latest_checkpoint)
+        else:
+            logger.info(f"Setting up new conversation model based on {self.config.base_model}")
+            model = AutoModelForCausalLM.from_pretrained(self.config.base_model)
+            
+            # Resize token embeddings for added special tokens
+            model.resize_token_embeddings(len(self.tokenizer))
+        
+        # Make sure the model knows about the padding token
+        if model.config.pad_token_id is None:
+            model.config.pad_token_id = self.tokenizer.pad_token_id
         
         self.model = model
         return model
     
     def setup_intent_model(self, num_labels):
         """Initialize the intent classification model"""
-        logger.info(f"Setting up intent classification model based on {self.config.base_model}")
-        model = AutoModelForSequenceClassification.from_pretrained(
-            self.config.base_model,
-            num_labels=num_labels
-        )
+        # Check for existing model to resume from
+        latest_checkpoint = None
+        if self.config.resume_training:
+            latest_checkpoint = self.find_latest_checkpoint("intent")
         
-        # Resize token embeddings for added special tokens
-        model.resize_token_embeddings(len(self.tokenizer))
+        if latest_checkpoint and os.path.exists(latest_checkpoint):
+            logger.info(f"Resuming intent model from checkpoint: {latest_checkpoint}")
+            model = AutoModelForSequenceClassification.from_pretrained(latest_checkpoint)
+        else:
+            logger.info(f"Setting up new intent classification model based on {self.config.base_model}")
+            model = AutoModelForSequenceClassification.from_pretrained(
+                self.config.base_model,
+                num_labels=num_labels
+            )
+            
+            # Resize token embeddings for added special tokens
+            model.resize_token_embeddings(len(self.tokenizer))
+        
+        # Make sure the model knows about the padding token
+        if model.config.pad_token_id is None:
+            model.config.pad_token_id = self.tokenizer.pad_token_id
         
         self.model = model
         return model
@@ -228,12 +286,19 @@ class ForthnlesTrainer:
         train_df = pd.read_csv(train_file)
         eval_df = pd.read_csv(eval_file)
         
-        # Create label map from training data
-        unique_intents = sorted(train_df['intent'].unique())
-        label_map = {intent: i for i, intent in enumerate(unique_intents)}
+        # Check if we have a saved label map from previous training
+        label_map_path = os.path.join(self.config.output_dir, "intent", "final_model", "label_map.json")
+        if os.path.exists(label_map_path) and self.config.resume_training:
+            with open(label_map_path, 'r') as f:
+                label_map = json.load(f)
+            logger.info(f"Loaded existing label map with {len(label_map)} intents")
+        else:
+            # Create label map from training data
+            unique_intents = sorted(train_df['intent'].unique())
+            label_map = {intent: i for i, intent in enumerate(unique_intents)}
+            logger.info(f"Created new label map with {len(label_map)} intents")
         
         logger.info(f"Loaded {len(train_df)} training examples and {len(eval_df)} validation examples")
-        logger.info(f"Intent classes: {unique_intents}")
         
         train_dataset = IntentDataset(train_df, self.tokenizer, label_map=label_map)
         eval_dataset = IntentDataset(eval_df, self.tokenizer, label_map=label_map)
@@ -269,7 +334,15 @@ class ForthnlesTrainer:
         
         logger.info("Training conversation model...")
         
-        # Setup training arguments
+        # Find latest checkpoint to resume from
+        resume_from_checkpoint = False
+        if self.config.resume_training:
+            latest_checkpoint = self.find_latest_checkpoint("conversation")
+            if latest_checkpoint:
+                resume_from_checkpoint = latest_checkpoint
+                logger.info(f"Will resume training from checkpoint: {resume_from_checkpoint}")
+        
+        # Setup training arguments - Fix: Change evaluation_strategy to eval_strategy
         training_args = TrainingArguments(
             output_dir=os.path.join(self.config.output_dir, "conversation"),
             overwrite_output_dir=True,
@@ -282,7 +355,7 @@ class ForthnlesTrainer:
             warmup_steps=self.config.warmup_steps,
             logging_dir=os.path.join(self.config.output_dir, "logs"),
             logging_steps=self.config.logging_steps,
-            eval_strategy="steps",  # Changed from evaluation_strategy to eval_strategy
+            eval_strategy="steps",  # Fixed: Changed from evaluation_strategy to eval_strategy
             save_steps=self.config.save_steps,
             eval_steps=self.config.eval_steps,
             load_best_model_at_end=True,
@@ -307,8 +380,8 @@ class ForthnlesTrainer:
             eval_dataset=self.eval_dataset
         )
         
-        # Start training
-        trainer.train()
+        # Start or resume training
+        trainer.train(resume_from_checkpoint=resume_from_checkpoint)
         
         # Save the final model
         self.model.save_pretrained(os.path.join(self.config.output_dir, "conversation", "final_model"))
@@ -324,20 +397,33 @@ class ForthnlesTrainer:
         
         logger.info("Training intent classification model...")
         
-        # Setup training arguments
+        # Find latest checkpoint to resume from
+        resume_from_checkpoint = False
+        if self.config.resume_training:
+            latest_checkpoint = self.find_latest_checkpoint("intent")
+            if latest_checkpoint:
+                resume_from_checkpoint = latest_checkpoint
+                logger.info(f"Will resume training from checkpoint: {resume_from_checkpoint}")
+        
+        # Set batch size to 1 if we know we'll have padding token issues
+        # or fix the real issue by ensuring the padding token is properly set
+        train_batch_size = 1 if self.config.train_batch_size > 1 and self.model.config.pad_token_id is None else self.config.train_batch_size
+        eval_batch_size = 1 if self.config.eval_batch_size > 1 and self.model.config.pad_token_id is None else self.config.eval_batch_size
+        
+        # Setup training arguments - Fix: Change evaluation_strategy to eval_strategy
         training_args = TrainingArguments(
             output_dir=os.path.join(self.config.output_dir, "intent"),
             overwrite_output_dir=True,
             num_train_epochs=self.config.num_train_epochs,
-            per_device_train_batch_size=self.config.train_batch_size,
-            per_device_eval_batch_size=self.config.eval_batch_size,
+            per_device_train_batch_size=train_batch_size,
+            per_device_eval_batch_size=eval_batch_size,
             gradient_accumulation_steps=self.config.gradient_accumulation_steps,
             learning_rate=self.config.learning_rate,
             weight_decay=self.config.weight_decay,
             warmup_steps=self.config.warmup_steps,
             logging_dir=os.path.join(self.config.output_dir, "logs"),
             logging_steps=self.config.logging_steps,
-            eval_strategy="steps",  # Changed from evaluation_strategy to eval_strategy
+            eval_strategy="steps",  # Fixed: Changed from evaluation_strategy to eval_strategy
             save_steps=self.config.save_steps,
             eval_steps=self.config.eval_steps,
             load_best_model_at_end=True,
@@ -356,8 +442,8 @@ class ForthnlesTrainer:
             compute_metrics=self.compute_metrics
         )
         
-        # Start training
-        trainer.train()
+        # Start or resume training
+        trainer.train(resume_from_checkpoint=resume_from_checkpoint)
         
         # Save the final model
         self.model.save_pretrained(os.path.join(self.config.output_dir, "intent", "final_model"))
@@ -420,6 +506,11 @@ class ForthnlesChat:
             # Set padding token if not set
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
+                self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+                
+            # Ensure the model knows about the padding token
+            if self.conversation_model.config.pad_token_id is None:
+                self.conversation_model.config.pad_token_id = self.tokenizer.pad_token_id
         else:
             logger.warning(f"Conversation model not found at {conv_model_path}")
         
@@ -428,6 +519,10 @@ class ForthnlesChat:
         if os.path.exists(intent_model_path):
             logger.info(f"Loading intent model from {intent_model_path}")
             self.intent_model = AutoModelForSequenceClassification.from_pretrained(intent_model_path).to(self.device)
+            
+            # Ensure the intent model knows about the padding token
+            if self.intent_model.config.pad_token_id is None and self.tokenizer is not None:
+                self.intent_model.config.pad_token_id = self.tokenizer.pad_token_id
             
             # Load label map
             label_map_path = os.path.join(intent_model_path, "label_map.json")
@@ -574,6 +669,8 @@ def main():
                         help="Training batch size")
     parser.add_argument("--use_wandb", action="store_true",
                         help="Use Weights & Biases for logging")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume training from latest checkpoint")
     
     args = parser.parse_args()
     
@@ -587,6 +684,7 @@ def main():
         config.train_batch_size = args.batch_size
         config.eval_batch_size = args.batch_size
         config.use_wandb = args.use_wandb
+        config.resume_training = args.resume
         
         # Create and train model
         trainer = ForthnlesTrainer(config)
